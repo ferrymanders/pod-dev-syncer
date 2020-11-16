@@ -10,7 +10,7 @@ The container you are syncing to does need to have write rights in the selected 
 ## Requirements
 
 This script requires you to have the following programs installed and in your path:
-  - kubectl - kubenetes client (https://kubernetes.io/docs/tasks/tools/install-kubectl/)
+  - kubectl - kubernetes client (https://kubernetes.io/docs/tasks/tools/install-kubectl/)
   - yq - tool to read and manipulate yaml files (https://github.com/mikefarah/yq#install)
 
 ## Usage

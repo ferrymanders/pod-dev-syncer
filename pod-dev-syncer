@@ -1,0 +1,292 @@
+#!/bin/bash
+
+
+
+### Functions
+function die()
+{ 
+    echo "$*" >&2; 
+    exit 1;
+}
+
+function ctrl_c() 
+{
+    echo -e "\n# Detected CTRL-C, cleaning up temp files and stopping"
+    touch $tmpLoc/updater.$session.stop
+}
+
+function yamlConfigRead()
+{
+    yamlConfig=$1
+    yamlVar=$2
+
+    case $yamlVar in
+        local.dirs)
+            temp=$(yq r $yamlConfig "$yamlVar" | sed 's/\- /;/g')
+            output=$(echo $temp | sed 's/^;//g' | sed 's/\s;/;/g')
+            ;;
+        *)
+            output=$(yq r $yamlConfig "$yamlVar")
+            ;;
+    esac
+
+    if [ -z "$output" ];
+    then
+        exit
+    fi
+    echo "$output"
+}
+
+function scanDir()
+{
+    dir=$1
+    files=$(ls -1d $dir/*)
+
+    unset IFS
+    for file in $files;
+    do
+        
+        if [ -d "$file" ]; 
+        then
+            echo "dir:$file"
+            scanDir "$file";
+            unset file
+        fi
+
+        if [ -f "$file" ];
+        then
+            echo "file:$file"
+        fi
+
+    done
+}
+
+function checkChanges()
+{
+    fileDb=$1
+    file=$2
+
+    checkFile=$(grep -E " $file$" $fileDb)
+
+    if [ -z "$checkFile" ];
+    then
+        # file not in fileDb yet, adding
+        if [ -f "$file" ];
+        then
+            md5sum $file >> $fileDb
+        else
+            echo "other $file" >> $fileDb
+        fi
+        echo "new"
+    else
+        if [ -f "$file" ];
+        then
+            md5new=$(md5sum $file)
+        else
+            md5new="other $file"
+        fi
+
+        if [ "$checkFile" != "$md5new" ];
+        then
+            echo "updated"
+            sed -i "s#^$checkFile\$#$md5new#g" $fileDb
+        else
+            echo "unchanged"
+        fi
+    fi
+}
+
+function checkPods()
+{
+    
+    namespace="$1"
+    shift
+    pods="$*"
+
+    checkedPods=""
+
+    for pod in $pods;
+    do
+        status=$(kubectl get pods -n $namespace $pod -o yaml | yq r - 'status.phase')
+        if [ "$status" == "Running" ];
+        then
+            checkedPods="$checkedPods $pod"
+        fi
+    done
+
+    if [ -z "$checkedPods" ];
+    then
+        echo false
+    else
+        echo "$checkedPods"
+    fi
+}
+
+usage="Usage: $myname [options]
+
+This tool will watch local directories for file changes and on change upload said file to 
+selected kubernetes container. This tool can be configured using a config file or commandline
+options.
+
+Options:
+    -C configfile               Start the watcher using a configfile
+    -n namespace                Select the namespace/project of your application
+    -p pod                      Select the pod you want to keep up-to-date
+    -c container                Select the container you want to keep up-to-date
+    -b path                     Select the local base directory
+    -d \"path:/path/in/pod\"    Select local path (excluding base directory from -b)
+                                and the path in the container.
+                                You can add multiple paths using ; as field seperator
+    -w number                   Wait time between runs in seconds, defaults to 5 seconds
+    "
+
+
+### Script
+myname=${0##*/}
+confused=false
+while getopts C:n:p:c:b:d:w:h c; do
+        case "$c" in
+                C) yamlConfig="$OPTARG";;
+                n) namespace="$OPTARG";;
+                p) pod="$OPTARG";;
+                c) container="$OPTARG";;
+                b) basedir="$OPTARG";;
+                d) dirs="$OPTARG";;
+                w) waitTime="$OPTARG";;
+                h) die "$usage";;
+                *) confused=true;;
+        esac
+done
+
+shift `expr $OPTIND`
+
+$confused && die "$usage"
+
+# Load configfile settings if configfile is set.
+if [ ! -z "$yamlConfig" ];
+then
+    # Load settings from configfile
+    : ${waitTime:=$(yamlConfigRead $yamlConfig settings.waitTime)}
+    : ${tmpLoc:=$(yamlConfigRead $yamlConfig settings.tmpLoc)}
+
+    : ${namespace:=$(yamlConfigRead $yamlConfig project.namespace)}
+    : ${pod:=$(yamlConfigRead $yamlConfig project.pod)}
+    : ${container:=$(yamlConfigRead $yamlConfig project.container)}
+
+    : ${basedir:=$(yamlConfigRead $yamlConfig local.basedir)}
+    : ${dirs:=$(yamlConfigRead $yamlConfig local.dirs)}
+    
+    # Use directory of configfile if no basedir is set
+    : ${basedir:=$(dirname $yamlConfig)}
+else
+    # if no basedir set and no configfile use current dir as basedir
+    : ${basedir:=$(pwd)}
+fi
+
+## Default settings not required to set
+: ${waitTime:=5}
+: ${tmpLoc:="/tmp"}
+
+
+
+
+session=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 8 | head -n 1)
+tmpFile=$tmpLoc/updater.$session.tmp
+
+# trap ctrl-c and call ctrl_c()
+trap ctrl_c INT
+
+echo "# To stop this updater press <ctrl>-c or create the file : $tmpLoc/updater.$session.stop"
+echo "# On script start it will upload all files in specified directores"
+
+podList=$(kubectl get pods -n $namespace | grep -Eo "$pod")
+pods=$(checkPods $namespace $podList)
+
+if [ "$pods" == "false" ];
+then
+    echo "# ERR: No pods found, adjust 'pod' setting. stopping"
+    exit
+else
+    echo "####"
+    echo "# Following pods detected : $pods"
+    echo ""
+fi 
+
+
+firstRun=true
+
+touch $tmpLoc/updater.$session.fileDb
+
+while [ ! -f $tmpLoc/updater.$session.stop ];
+do 
+    for pod in $pods;
+    do
+        IFS=';'
+        for dir in $dirs;
+        do
+            fromDir=$(echo $dir | awk -F ':' '{print $1}')
+            toDir=$(echo $dir | awk -F ':' '{print $2}')
+
+            # Making sure the receiving directories exist
+            if [ "$firstRun" == "true" ];
+            then
+                kubectl -n $namespace exec -c $container $pod -- mkdir -p $toDir
+            fi
+
+            if [ -d "$basedir/$fromDir" ];
+            then
+                fromLoc="$basedir/$fromDir"
+            elif [ -d "$fromDir" ];
+            then
+                fromLoc=$(realpath "$fromDir")
+            else
+                echo "# Err: $fromDir not a directory"
+                rm $tmpLoc/updater.$session.*
+                exit
+            fi
+
+            # Scan directory for deeper directories and files
+            scanDir "$fromLoc" > $tmpLoc/updater.$session.fileList.tmp
+
+            while read line;
+            do
+                itemType=$(echo $line | awk -F ':' '{print $1}')
+                itemLocation=$(echo $line | awk -F ':' '{print $2}')
+                itemFile=$(basename "$itemLocation")
+                itemDir=$(dirname "$itemLocation")
+                itemShortDir=$(echo $itemDir | sed "s#$fromLoc##g")
+
+                checkFile=$(checkChanges $tmpLoc/updater.$session.fileDb $itemLocation)
+
+                run=false
+                case $checkFile in
+                    new)        run=true;;
+                    updated)    run=true;;
+                    unchanged)  run=false;;
+                esac
+
+                if [ $run == "true" ];
+                then
+                    timeStamp=$(date "+%Y-%m-%d %H:%M:%S")
+                    echo "# [$timeStamp] file $checkFile, uploading : ${fromDir}${itemShortDir}/$itemFile"
+                    kubectl -n $namespace cp -c $container $itemLocation $pod:${toDir}${itemShortDir}
+                fi
+
+            done < $tmpLoc/updater.$session.fileList.tmp
+
+            rm $tmpLoc/updater.$session.fileList.tmp
+        done
+        unset IFS
+    done
+
+    if [ "$firstRun" == "true" ];
+    then
+        echo "# First Run is done, will check for new files every $waitTime seconds"
+        firstRun=false
+    fi
+
+    # Wait timer
+    sleep $waitTime
+done
+
+rm $tmpLoc/updater.$session.*
